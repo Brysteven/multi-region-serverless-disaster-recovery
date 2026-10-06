@@ -51,7 +51,7 @@ Prerequisites: AWS CLI v2 with credentials configured, AWS SAM CLI, Python 3.13,
 
 ```bash
 git clone https://github.com/Brysteven/multi-region-serverless-disaster-recovery.git
-cd dr-serverless
+cd multi-region-serverless-disaster-recovery
 aws sts get-caller-identity
 sam validate
 sam build
