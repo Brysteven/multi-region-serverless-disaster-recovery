@@ -50,7 +50,7 @@ Five drills were executed. Failback to region A completed cleanly in each succes
 Prerequisites: AWS CLI v2 with credentials configured, AWS SAM CLI, Python 3.13, and a bash shell such as Git Bash on Windows.
 
 ```bash
-git clone https://github.com/Brysteven/dr-serverless.git
+git clone https://github.com/Brysteven/multi-region-serverless-disaster-recovery.git
 cd dr-serverless
 aws sts get-caller-identity
 sam validate
