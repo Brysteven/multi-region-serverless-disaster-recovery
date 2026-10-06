@@ -1,0 +1,15 @@
+# build and deployment artifacts
+.aws-sam/
+__pycache__/
+*.pyc
+.aws/
+
+# development
+evidence/
+implementation-stages/
+drilldeny.json
+disaster-recovery-design.md
+samconfig.toml
+objs-*.json
+dm-*.json
+bucket-a-policy.json

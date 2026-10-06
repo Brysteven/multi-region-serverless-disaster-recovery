@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Multi-region disaster recovery architecture for a serverless application
+
+Parameters:
+  TableName:
+    Type: String
+    Default: dr-items
+  BucketPrefix:
+    Type: String
+    Default: dr-site-demo
+    Description: Prefix for the site bucket names.
+  DomainName:
+    Type: String
+    Default: ""
+  AlarmEmail:
+    Type: String
+    Default: ""
+  HostedZoneId:
+    Type: String
+    Default: ""
+
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref "AWS::Region", "us-east-1"]
+  IsStandbyRegion: !Equals [!Ref "AWS::Region", "ap-southeast-1"]
+  HasDomain: !Not [!Equals [!Ref "DomainName", ""]]
+  PrimaryWithDomain: !And
+    - !Condition IsPrimaryRegion
+    - !Condition HasDomain
+  StandbyWithDomain: !And
+    - !Condition IsStandbyRegion
+    - !Condition HasDomain
+
+Resources:
+  DrItemsGlobalTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Condition: IsPrimaryRegion
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      Replicas:
+        - Region: us-east-1
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+        - Region: ap-southeast-1
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  HealthApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      EndpointConfiguration:
+        Type: REGIONAL
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/health/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+      MemorySize: 128
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+      Events:
+        GetHealth:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthApi
+            Path: /health
+            Method: get
+
+  CreateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/create/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+      MemorySize: 128
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+      Events:
+        PostItems:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthApi
+            Path: /items
+            Method: post
+
+  GetItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/get/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+      MemorySize: 128
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+      Events:
+        GetItem:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HealthApi
+            Path: /items/{id}
+            Method: get
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  HealthApiAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: dr-serverless-api-5xx
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref HealthApi
+        - Name: Stage
+          Value: Prod
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  SiteBucketA:
+    Type: AWS::S3::Bucket
+    Condition: IsPrimaryRegion
+    Properties:
+      BucketName: !Sub "${BucketPrefix}-${AWS::Region}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+          - Id: site-crr
+            Status: Enabled
+            Destination:
+              Bucket: !Sub arn:aws:s3:::${BucketPrefix}-ap-southeast-1-${AWS::AccountId}
+
+  SiteBucketB:
+    Type: AWS::S3::Bucket
+    Condition: IsStandbyRegion
+    Properties:
+      BucketName: !Sub "${BucketPrefix}-${AWS::Region}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: replicare
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                  - s3:GetObjectVersion
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionForReplication
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketPrefix}-us-east-1-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::${BucketPrefix}-us-east-1-${AWS::AccountId}/*
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource: !Sub arn:aws:s3:::${BucketPrefix}-ap-southeast-1-${AWS::AccountId}/*
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: IsPrimaryRegion
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${BucketPrefix}-oac"
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        OriginAccessControlOriginType: s3
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: IsPrimaryRegion
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases: !If
+          - HasDomain
+          - [!Sub "app.dr.${DomainName}"]
+          - !Ref "AWS::NoValue"
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref AppCertificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: site-origin-a
+            DomainName: !GetAtt SiteBucketA.RegionalDomainName
+            OriginAccessControlId: !Ref SiteOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: site-origin-b
+            DomainName: !Sub "${BucketPrefix}-ap-southeast-1-${AWS::AccountId}.s3.ap-southeast-1.amazonaws.com"
+            OriginAccessControlId: !Ref SiteOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        OriginGroups:
+          Quantity: 1
+          Items:
+            - Id: site-origin-group
+              FailoverCriteria:
+                StatusCodes:
+                  Quantity: 6
+                  Items:
+                    - 403
+                    - 404
+                    - 500
+                    - 502
+                    - 503
+                    - 504
+              Members:
+                Quantity: 2
+                Items:
+                  - OriginId: site-origin-a
+                  - OriginId: site-origin-b
+        DefaultCacheBehavior:
+          TargetOriginId: site-origin-group
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  SiteBucketAPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsPrimaryRegion
+    Properties:
+      Bucket: !Ref SiteBucketA
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontA
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${SiteBucketA}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  SiteBucketBPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: IsPrimaryRegion
+    Properties:
+      Bucket: !Sub "${BucketPrefix}-ap-southeast-1-${AWS::AccountId}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontB
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${BucketPrefix}-ap-southeast-1-${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  HealthCheckA:
+    Type: AWS::Route53::HealthCheck
+    Condition: IsPrimaryRegion
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        FullyQualifiedDomainName: !Sub "${HealthApi}.execute-api.${AWS::Region}.amazonaws.com"
+        ResourcePath: /Prod/health
+        RequestInterval: 30
+        FailureThreshold: 3
+
+  HealthCheckB:
+    Type: AWS::Route53::HealthCheck
+    Condition: IsStandbyRegion
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        FullyQualifiedDomainName: !Sub "${HealthApi}.execute-api.${AWS::Region}.amazonaws.com"
+        ResourcePath: /Prod/health
+        RequestInterval: 30
+        FailureThreshold: 3
+
+  AppCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: PrimaryWithDomain
+    Properties:
+      DomainName: !Sub "app.dr.${DomainName}"
+      ValidationMethod: DNS
+
+  ApiCertificateA:
+    Type: AWS::CertificateManager::Certificate
+    Condition: PrimaryWithDomain
+    Properties:
+      DomainName: !Sub "api.dr.${DomainName}"
+      ValidationMethod: DNS
+
+  ApiCertificateB:
+    Type: AWS::CertificateManager::Certificate
+    Condition: StandbyWithDomain
+    Properties:
+      DomainName: !Sub "api.dr.${DomainName}"
+      ValidationMethod: DNS
+
+  ApiDomainA:
+    Type: AWS::ApiGateway::DomainName
+    Condition: PrimaryWithDomain
+    Properties:
+      DomainName: !Sub "api.dr.${DomainName}"
+      RegionalCertificateArn: !Ref ApiCertificateA
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiDomainB:
+    Type: AWS::ApiGateway::DomainName
+    Condition: StandbyWithDomain
+    Properties:
+      DomainName: !Sub "api.dr.${DomainName}"
+      RegionalCertificateArn: !Ref ApiCertificateB
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiMappingA:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: PrimaryWithDomain
+    Properties:
+      DomainName: !Ref ApiDomainA
+      RestApiId: !Ref HealthApi
+      Stage: Prod
+
+  ApiMappingB:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: StandbyWithDomain
+    Properties:
+      DomainName: !Ref ApiDomainB
+      RestApiId: !Ref HealthApi
+      Stage: Prod
+
+  AppAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: PrimaryWithDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "app.dr.${DomainName}"
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  ApiFailoverRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: PrimaryWithDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "api.dr.${DomainName}"
+      Type: CNAME
+      TTL: 60
+      SetIdentifier: api-region-a
+      Failover: PRIMARY
+      HealthCheckId: !Ref HealthCheckA
+      ResourceRecords:
+        - !GetAtt ApiDomainA.RegionalDomainName
+
+  ApiFailoverRecordB:
+    Type: AWS::Route53::RecordSet
+    Condition: StandbyWithDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "api.dr.${DomainName}"
+      Type: CNAME
+      TTL: 60
+      SetIdentifier: api-region-b
+      Failover: SECONDARY
+      HealthCheckId: !Ref HealthCheckB
+      ResourceRecords:
+        - !GetAtt ApiDomainB.RegionalDomainName
+
+Outputs:
+  TableName:
+    Value: !Ref TableName
+  TableArn:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt DrItemsGlobalTable.Arn
+  ApiUrl:
+    Description: API Gateway base URL
+    Value: !Sub "https://${HealthApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  FrontendBucketName:
+    Condition: IsPrimaryRegion
+    Value: !Ref SiteBucketA
+  SiteDomain:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt SiteDistribution.DomainName
